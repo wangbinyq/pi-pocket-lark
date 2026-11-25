@@ -6,7 +6,7 @@
  * 限流、磁盘队列和重试都是 Relay 的事。Pi 还不能往飞书发图片或文件。
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -18,6 +18,10 @@ export const KIND = "lark";
 const DEFAULT_BINARY = "lark-cli";
 const DEFAULT_MAX_CHARS = 3000;
 const KEY_LIMIT = 50;
+const MAX_FILE_BYTES = 30 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_SENT_FILES = 10;
+const FILE_KEY_BASE = 100;
 const KIND_ONLY = new Set(["image", "file", "audio", "video", "media", "sticker"]);
 
 type RelayValues = Readonly<Record<string, string | number | boolean | undefined>>;
@@ -90,6 +94,7 @@ interface RelayConnector {
     description?: string;
     fields: readonly RelayField[];
     shape: "poll" | "stream";
+    files?: { max: number; maxBytes: number };
     interval?: number;
     mentions?: boolean;
     idempotentReply?: boolean;
@@ -191,6 +196,17 @@ function looksText(data: Uint8Array): boolean {
     }
 }
 
+export function safeName(name: string): string {
+    const base = name.split(/[\\/]/).at(-1) ?? "";
+    const cleaned = base
+        .replace(/[\u0000-\u001f:<>"|?*]+/g, "_")
+        .replace(/^\.+/, "")
+        .trim()
+        .slice(0, 80);
+
+    return cleaned === "" ? "file" : cleaned;
+}
+
 export function mimeOf(data: Uint8Array, name: string): string {
     const head = Array.from(data.subarray(0, 12), (byte) => byte.toString(16).padStart(2, "0")).join("");
 
@@ -237,6 +253,10 @@ export function mimeOf(data: Uint8Array, name: string): string {
     };
 
     return byExtension[extension] ?? "application/octet-stream";
+}
+
+export function attachmentKind(file: { name: string; data: Uint8Array }): "image" | "file" {
+    return mimeOf(file.data, file.name).startsWith("image/") ? "image" : "file";
 }
 
 export function eventOf(raw: unknown, rules: Rules): RelayEvent | undefined {
@@ -372,10 +392,20 @@ function profileArgs(values: RelayValues): string[] {
     return profile === undefined ? [] : ["--profile", profile];
 }
 
-function runCli(values: RelayValues, args: string[], signal: AbortSignal, input?: string): Promise<Command> {
-    const child = spawn(binary(values), [...args, ...profileArgs(values)], { stdio: ["pipe", "pipe", "pipe"] });
+function runCli(
+    values: RelayValues,
+    args: string[],
+    signal: AbortSignal,
+    options: { input?: string; cwd?: string } = {},
+): Promise<Command> {
+    const child = spawn(binary(values), [...args, ...profileArgs(values)], {
+        stdio: ["pipe", "pipe", "pipe"],
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    });
     const stop = () => child.kill("SIGTERM");
     signal.addEventListener("abort", stop, { once: true });
+
+    const input = options.input;
 
     if (input === undefined) {
         child.stdin.destroy();
@@ -554,10 +584,11 @@ function lark(): RelayConnector {
     return {
         kind: KIND,
         label: "Lark",
-        description: "飞书：私聊机器人，或在群里 @ 机器人。图片和文件可以下载给 Pi 看。",
+        description: "飞书：私聊机器人，或在群里 @ 机器人。图片和文件两边都能带。",
         shape: "stream",
         mentions: true,
         idempotentReply: true,
+        files: { max: MAX_SENT_FILES, maxBytes: MAX_FILE_BYTES },
         fields: [
             { name: "binary", label: "lark-cli", type: "text", default: DEFAULT_BINARY },
             { name: "profile", label: "Profile", type: "text", placeholder: "default" },
@@ -684,9 +715,14 @@ function lark(): RelayConnector {
 
             const max = Number(context.values.max_chars ?? DEFAULT_MAX_CHARS);
             const parts = splitText(reply.text, Number.isFinite(max) && max > 0 ? max : DEFAULT_MAX_CHARS);
+            const files = reply.files ?? [];
 
-            if (parts.length === 0) {
+            if (parts.length === 0 && files.length === 0) {
                 throw new Error("回复是空的。");
+            }
+
+            if (files.length > MAX_SENT_FILES) {
+                throw new Error(`飞书一次最多发 ${MAX_SENT_FILES} 个文件。`);
             }
 
             let id: string | undefined;
@@ -709,7 +745,7 @@ function lark(): RelayConnector {
                         "json",
                     ],
                     context.signal,
-                    part,
+                    { input: part },
                 );
 
                 if (command.code !== 0) {
@@ -717,6 +753,56 @@ function lark(): RelayConnector {
                 }
 
                 id = messageId(command) ?? id;
+            }
+
+            if (files.length === 0) {
+                return id === undefined ? undefined : { id };
+            }
+
+            const folder = mkdtempSync(join(tmpdir(), "lark-send-"));
+
+            try {
+                for (const [index, file] of files.entries()) {
+                    const name = safeName(file.name);
+                    const kind = attachmentKind(file);
+                    const size = file.data.length;
+
+                    if (size > (kind === "image" ? MAX_IMAGE_BYTES : MAX_FILE_BYTES)) {
+                        throw new Error(`"${name}" 有 ${size} 字节，超过飞书对${kind === "image" ? "图片" : "文件"}的上限。`);
+                    }
+
+                    writeFileSync(join(folder, name), file.data);
+
+                    const command = await runCli(
+                        context.values,
+                        [
+                            "im",
+                            "+messages-reply",
+                            "--message-id",
+                            target,
+                            "--as",
+                            "bot",
+                            `--${kind}`,
+                            `./${name}`,
+                            "--idempotency-key",
+                            replyKey(reply.key, FILE_KEY_BASE + index),
+                            "--format",
+                            "json",
+                        ],
+                        context.signal,
+                        { cwd: folder },
+                    );
+
+                    if (command.code !== 0) {
+                        throw new Error(
+                            `飞书没有收下 "${name}"：${reasonOf(command) ?? `lark-cli 退出（code ${command.code}）`}`,
+                        );
+                    }
+
+                    id = messageId(command) ?? id;
+                }
+            } finally {
+                rmSync(folder, { recursive: true, force: true });
             }
 
             return id === undefined ? undefined : { id };

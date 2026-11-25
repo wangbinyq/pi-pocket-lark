@@ -4,7 +4,7 @@ A [Pi Pocket](https://github.com/TannerMidd/pi-pocket) drop-in that connects Lar
 People write to the app's bot in a direct chat, or name it in a group; Pi answers in the session, and the answer goes
 back to where it came from. Images and files that people send come through as files Pi can read.
 
-Status: **direct chats and group mentions, text, images, and files.** Pi cannot send an image or a file back yet.
+Status: **direct chats and group mentions, text, images, and files, both ways.**
 
 ## How it works
 
@@ -13,6 +13,7 @@ Lark -> lark-cli event consume (long connection, no public address)
   -> lark connector (this drop-in) -> Relay: filter, fence, dedupe, rate limit, on-disk queue
   -> inbox -> the session's Pi -> relay_reply -> this connector -> lark-cli im +messages-reply
                                        -> relay_fetch -> this connector -> lark-cli im +messages-resources-download
+Pi gives paths -> relay_reply files -> this connector -> lark-cli im +messages-reply --image/--file
 ```
 
 - The connector registers with Pi Pocket's built-in **Relay** extension (`web.use("pocket-relay")`, API 1), so
@@ -36,6 +37,22 @@ Lark -> lark-cli event consume (long connection, no public address)
 Downloaded files land in the session's `.relay/` folder, at most 25 MB each and 10 to an event. The type is read from
 the bytes, so a PNG without an extension still arrives as an image, and a text file stays `text/plain` even when
 `lark-cli` saved it as `.bin`.
+
+## What Pi can send
+
+Pi calls `relay_reply` with `files`, the paths of files in the session's folder. The relay reads them and refuses a
+path that leaves the folder, a hidden one, and one in the data folder.
+
+The answer's text goes first, as its own message; then each file goes as its own reply: an image as a Lark image, and
+anything else as a file, with its own name. What counts as an image is read from the bytes, not the name.
+
+| Limit | Value |
+| --- | --- |
+| Files in one reply | 10 |
+| One file | 30 MB |
+| One image | 10 MB |
+
+The relay allows 100 MB in all for one reply, and 120 seconds to send it.
 
 ## Requirements
 
@@ -82,6 +99,8 @@ Then, in Pi Pocket:
 | Images and files | The bot downloads both with `im +messages-resources-download --type image\|file`; the rendered content carries `img_…` and `<file key=\"file_…\" name=\"…\"/>` |
 | Bot identity | `api GET /open-apis/bot/v3/info --as bot` gives `open_id` and `app_name` |
 | Attachment path | `+messages-resources-download` may rename what it saves (`LICENSE` becomes `LICENSE.bin`) and answers `data.saved_path`; the connector reads that path, never the one it asked for |
+| Sending a picture | `im +messages-reply --image ./x.png` arrives as an `image` message; `--file ./x` arrives as a `file` message, under its own name |
+| Relative paths only | `lark-cli` refuses an absolute path, so the connector writes the bytes to a temporary folder and runs the command there |
 
 Not yet seen on a live app: a group mention, because this app's bot cannot be added to a group. The connector
 matches either the bot's open id or its app name, and a group message that matches neither is dropped, so a wrong
@@ -94,9 +113,10 @@ node --test test/*.test.ts
 ```
 
 The tests cover the pure parts: one event line, the chat and group rules, what an image or a file becomes, the
-attachment refs, a file's type, cutting a long reply, and the reply key. They make no network call. A fake `lark-cli`
-drives the spawn paths: an abort returns in under a second, a split reply reaches it in parts, and a download comes
-back as bytes.
+attachment refs, a file's type, a name made safe to send, what goes as an image, cutting a long reply, and the reply
+key. They make no network call. A fake `lark-cli` drives the spawn paths: an abort returns in under a second, a split
+reply reaches it in parts, a download comes back as bytes, and a reply with pictures reaches it as relative paths in
+a folder that is gone afterwards.
 
 Type check, with a `tsc` 5.9 or later and Pi Pocket's packages linked as `node_modules`:
 
@@ -109,6 +129,7 @@ tsc --noEmit -p .
 - One consumer of `im.message.receive_v1` for each app: a second `lark-cli event consume` (a probe too) makes Pi
   answer twice. Every probe runs with `--timeout`.
 - Messages sent while the connector is down are lost: Lark retries an event for a short time only.
-- Pi cannot send an image or a file back: a reply is text.
 - A sticker has nothing to download.
+- An answer with files is several messages: the text, then one for each file. Lark takes one kind of content in each
+  call, so text and attachment cannot share a message.
 - A group needs the bot in it. Where an app's availability keeps the bot out of groups, only direct chats are possible.

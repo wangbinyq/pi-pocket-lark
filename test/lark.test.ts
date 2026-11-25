@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+    attachmentKind,
     eventOf,
     mimeOf,
     parseEventLine,
     refOf,
     replyKey,
     resourcesOf,
+    safeName,
     splitText,
     words,
 } from "../lark.ts";
@@ -117,6 +119,25 @@ test("a file's type comes from its bytes, then its name", () => {
     assert.equal(mimeOf(new TextEncoder().encode("hello"), "mystery"), "text/plain");
     assert.equal(mimeOf(new Uint8Array([0x00, 0x01, 0x02, 0x03]), "mystery"), "application/octet-stream");
     assert.equal(mimeOf(new Uint8Array([0x00, 0x01]), "drawing.bin"), "application/octet-stream");
+});
+
+test("a name sent to Lark keeps only its last part", () => {
+    assert.equal(safeName("../../etc/passwd"), "passwd");
+    assert.equal(safeName("a/b\\c.png"), "c.png");
+    assert.equal(safeName("报告 2026.pdf"), "报告 2026.pdf");
+    assert.equal(safeName(".hidden"), "hidden");
+    assert.equal(safeName(""), "file");
+    assert.equal(safeName("x".repeat(200) + ".png").length, 80);
+    assert.equal(safeName('a<b>c|d?e*f:"g".txt'), "a_b_c_d_e_f_g_.txt");
+});
+
+test("what to send is read from the bytes, not the name", () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const pdf = new TextEncoder().encode("%PDF-1.7");
+
+    assert.equal(attachmentKind({ name: "no-extension", data: png }), "image");
+    assert.equal(attachmentKind({ name: "report.pdf", data: pdf }), "file");
+    assert.equal(attachmentKind({ name: "notes.txt", data: new TextEncoder().encode("hi") }), "file");
 });
 
 test("a reply that fits stays one message", () => {
