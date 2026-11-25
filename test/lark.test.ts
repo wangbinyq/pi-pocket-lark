@@ -113,8 +113,10 @@ test("a file's type comes from its bytes, then its name", () => {
 
     assert.equal(mimeOf(png, "image"), "image/png");
     assert.equal(mimeOf(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), "image"), "image/jpeg");
-    assert.equal(mimeOf(new TextEncoder().encode("hello"), "note.txt"), "text/plain");
-    assert.equal(mimeOf(new TextEncoder().encode("hello"), "mystery"), "application/octet-stream");
+    assert.equal(mimeOf(new TextEncoder().encode("MIT License\n"), "LICENSE.bin"), "text/plain");
+    assert.equal(mimeOf(new TextEncoder().encode("hello"), "mystery"), "text/plain");
+    assert.equal(mimeOf(new Uint8Array([0x00, 0x01, 0x02, 0x03]), "mystery"), "application/octet-stream");
+    assert.equal(mimeOf(new Uint8Array([0x00, 0x01]), "drawing.bin"), "application/octet-stream");
 });
 
 test("a reply that fits stays one message", () => {

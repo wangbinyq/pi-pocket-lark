@@ -8,7 +8,7 @@
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Web } from "./_pocket.d.ts";
@@ -176,6 +176,21 @@ export function refOf(ref: string): { messageId: string; kind: "image" | "file";
     return { messageId, kind, key };
 }
 
+function looksText(data: Uint8Array): boolean {
+    const head = data.subarray(0, 512);
+
+    if (head.includes(0)) {
+        return false;
+    }
+
+    try {
+        new TextDecoder("utf-8", { fatal: true }).decode(head);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 export function mimeOf(data: Uint8Array, name: string): string {
     const head = Array.from(data.subarray(0, 12), (byte) => byte.toString(16).padStart(2, "0")).join("");
 
@@ -197,6 +212,10 @@ export function mimeOf(data: Uint8Array, name: string): string {
 
     if (head.startsWith("25504446")) {
         return "application/pdf";
+    }
+
+    if (looksText(data)) {
+        return "text/plain";
     }
 
     const extension = name.toLowerCase().split(".").at(-1) ?? "";
@@ -417,6 +436,20 @@ function reasonOf(command: Command): string | undefined {
     );
 }
 
+function savedPath(stdout: string): string | undefined {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(stdout.trim());
+    } catch {
+        return undefined;
+    }
+
+    const data = record(record(parsed)?.data);
+
+    return text(data?.saved_path);
+}
+
 function messageId(command: Command): string | undefined {
     let parsed: unknown;
 
@@ -497,15 +530,21 @@ async function fetchFile(
             throw new Error(`飞书没有给出这个附件：${reasonOf(command) ?? "没有说明"}`);
         }
 
-        const size = statSync(output).size;
+        const saved = savedPath(command.stdout) ?? output;
+
+        if (!resolve(saved).startsWith(resolve(folder) + sep)) {
+            throw new Error("lark-cli 把附件存到了别处。");
+        }
+
+        const size = statSync(saved).size;
 
         if (size > maxBytes) {
             throw new Error(`这个附件有 ${size} 字节，超过上限 ${maxBytes} 字节。`);
         }
 
-        const data = readFileSync(output);
+        const data = readFileSync(saved);
 
-        return { data, type: mimeOf(data, name) };
+        return { data, type: mimeOf(data, basename(saved)) };
     } finally {
         rmSync(folder, { recursive: true, force: true });
     }
