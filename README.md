@@ -34,7 +34,8 @@ Lark -> lark-cli event consume (long connection, no public address)
 | A rich post | its words, and a `files` entry for each picture in it |
 
 Downloaded files land in the session's `.relay/` folder, at most 25 MB each and 10 to an event. The type is read from
-the bytes, so a PNG without an extension still arrives as an image.
+the bytes, so a PNG without an extension still arrives as an image, and a text file stays `text/plain` even when
+`lark-cli` saved it as `.bin`.
 
 ## Requirements
 
@@ -80,6 +81,7 @@ Then, in Pi Pocket:
 | No echo | The bot's own messages do not come back as `im.message.receive_v1`; the connector also drops `sender_type` other than `user` |
 | Images and files | The bot downloads both with `im +messages-resources-download --type image\|file`; the rendered content carries `img_…` and `<file key=\"file_…\" name=\"…\"/>` |
 | Bot identity | `api GET /open-apis/bot/v3/info --as bot` gives `open_id` and `app_name` |
+| Attachment path | `+messages-resources-download` may rename what it saves (`LICENSE` becomes `LICENSE.bin`) and answers `data.saved_path`; the connector reads that path, never the one it asked for |
 
 Not yet seen on a live app: a group mention (the mention's id for a bot), so the connector matches either the bot's
 open id or its app name.

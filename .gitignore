@@ -1,3 +1,4 @@
 node_modules
 _pocket.d.ts
+.relay
 *.log
