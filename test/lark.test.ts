@@ -14,14 +14,14 @@ import {
 const NO_CHATS = new Set<string>();
 const BOT = { id: "ou_0123456789abcdef0123456789abcdef", name: "测试助手" };
 
-const PING = '{"type":"im.message.receive_v1","event_id":"0f0e0d0c0b0a09080706050403020100","timestamp":"1795580234859","id":"om_x100b7f525a6828accff04f86ab74a01","message_id":"om_x100b7f525a6828accff04f86ab74a01","create_time":"1795580234488","chat_id":"oc_0123456789abcdef0123456789abcdef","chat_type":"p2p","message_type":"text","sender_id":"ou_0123456789abcdef0123456789abcdef","sender_type":"user","content":"ping"}';
+const PING = '{"type":"im.message.receive_v1","event_id":"0f0e0d0c0b0a09080706050403020100","timestamp":"1795580234859","id":"om_abcd0000000000000000000000000001","message_id":"om_abcd0000000000000000000000000001","create_time":"1795580234488","chat_id":"oc_0123456789abcdef0123456789abcdef","chat_type":"p2p","message_type":"text","sender_id":"ou_0123456789abcdef0123456789abcdef","sender_type":"user","content":"ping"}';
 
 const RAW = JSON.parse(PING);
 const GROUP = { ...RAW, chat_type: "group" };
 
 test("a real direct message becomes an event", () => {
     assert.deepEqual(parseEventLine(PING, { chats: NO_CHATS }), {
-        id: "om_x100b7f525a6828accff04f86ab74a01",
+        id: "om_abcd0000000000000000000000000001",
         text: "ping",
         author: { id: "ou_0123456789abcdef0123456789abcdef", name: "ou_0123456789abcdef0123456789abcdef", bot: false },
         channel: "oc_0123456789abcdef0123456789abcdef",
@@ -70,7 +70,7 @@ test("an image keeps a file to download and no key in the text", () => {
     assert.equal(event?.text, "");
     assert.deepEqual(event?.attachments, ["image image"]);
     assert.deepEqual(event?.files, [
-        { name: "image", ref: "om_x100b7f525a6828accff04f86ab74a01|image|img_v3_0123abcd-4567" },
+        { name: "image", ref: "om_abcd0000000000000000000000000001|image|img_v3_0123abcd-4567" },
     ]);
 });
 
@@ -81,7 +81,7 @@ test("a file keeps its name and a way to download it", () => {
     );
 
     assert.deepEqual(event?.files, [
-        { name: "note.txt", ref: "om_x100b7f525a6828accff04f86ab74a01|file|file_v3_0017p_abcd" },
+        { name: "note.txt", ref: "om_abcd0000000000000000000000000001|file|file_v3_0017p_abcd" },
     ]);
 });
 

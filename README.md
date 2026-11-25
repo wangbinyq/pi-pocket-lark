@@ -1,16 +1,18 @@
 # pi-pocket-lark
 
-A [Pi Pocket](https://github.com/TannerMidd/pi-pocket) drop-in that connects a Lark/Feishu direct chat to a Pi Pocket
-session. People write to the app's bot in Lark, Pi answers in the session, and the answer goes back to the same chat.
+A [Pi Pocket](https://github.com/TannerMidd/pi-pocket) drop-in that connects Lark/Feishu to a Pi Pocket session.
+People write to the app's bot in a direct chat, or name it in a group; Pi answers in the session, and the answer goes
+back to where it came from. Images and files that people send come through as files Pi can read.
 
-Status: **direct chats, text only.** Group chats with an @mention, and images and files, are not connected yet.
+Status: **direct chats and group mentions, text, images, and files.** Pi cannot send an image or a file back yet.
 
 ## How it works
 
 ```
-Lark direct chat -> lark-cli event consume (long connection, no public address)
+Lark -> lark-cli event consume (long connection, no public address)
   -> lark connector (this drop-in) -> Relay: filter, fence, dedupe, rate limit, on-disk queue
   -> inbox -> the session's Pi -> relay_reply -> this connector -> lark-cli im +messages-reply
+                                       -> relay_fetch -> this connector -> lark-cli im +messages-resources-download
 ```
 
 - The connector registers with Pi Pocket's built-in **Relay** extension (`web.use("pocket-relay")`, API 1), so
@@ -21,13 +23,28 @@ Lark direct chat -> lark-cli event consume (long connection, no public address)
 - A reply goes back as a reply to the message it answers. Long answers are cut at a paragraph, then a line, then
   the character count, and each part is sent as its own message.
 
+## What comes through
+
+| In Lark | What Pi gets |
+| --- | --- |
+| A direct message | the message |
+| A group message that names the bot | the message; every other group message is dropped |
+| An image | `files` entry `image`; Pi calls `relay_fetch` to read its bytes |
+| A file, audio, or video | `files` entry with its own name |
+| A rich post | its words, and a `files` entry for each picture in it |
+
+Downloaded files land in the session's `.relay/` folder, at most 25 MB each and 10 to an event. The type is read from
+the bytes, so a PNG without an extension still arrives as an image.
+
 ## Requirements
 
 - Pi Pocket 0.29.0 or later, with **Relay** turned on (Menu -> Extensions).
-- `lark-cli` 1.0.x signed in for a Feishu app, with the bot in the direct chat and `im.message.receive_v1`
-  enabled in the developer console. `lark-cli doctor` and `lark-cli event schema im.message.receive_v1` tell
-  the state.
-- The person writes the bot first: a bot cannot open a direct chat on its own.
+- `lark-cli` 1.0.x signed in for a Feishu app, with the bot in the chat and `im.message.receive_v1` enabled in
+  the developer console. `lark-cli doctor` and `lark-cli event schema im.message.receive_v1` tell the state.
+- The person writes the bot first: a bot cannot open a direct chat on its own. For a group, the bot must be in it.
+- `GET /open-apis/bot/v3/info` answers for the bot: the connector asks once at start for its open id and name, which
+  are how a group message that names the bot is recognized. Without that answer, only direct chats come through, and
+  the connector says so in the server log.
 
 ## Install
 
@@ -44,22 +61,28 @@ Then, in Pi Pocket:
 
 ## What the connector asks for
 
-| Field      | Meaning                                                                     |
-| ---------- | --------------------------------------------------------------------------- |
-| `binary`   | The `lark-cli` program, or its full path.                                   |
-| `profile`  | A `lark-cli --profile` name. Empty uses the default profile.                |
-| `chats`    | Only these `oc_…` direct chats, separated by commas. Empty takes every one. |
-| `max_chars` | The most characters in one Lark message. Longer answers are sent in parts.  |
+| Field | Meaning |
+| --- | --- |
+| `binary` | The `lark-cli` program, or its full path. |
+| `profile` | A `lark-cli --profile` name. Empty uses the default profile. |
+| `chats` | Only these `oc_…` chats, separated by commas. Empty takes every one. |
+| `groups` | On: a group message that names the bot comes through. Off: direct chats only. |
+| `max_chars` | The most characters in one Lark message. Longer answers are sent in parts. |
 
 ## What was checked on a live Lark app
 
-| Check                | Result                                                                                        |
-| -------------------- | --------------------------------------------------------------------------------------------- |
-| Receiving            | One JSON line per message: `message_id`, `chat_id` (`oc_…`), `chat_type`, `sender_id` (`ou_…`), `sender_type`, `content` (already rendered), `create_time` (ms) |
-| Sending              | `im +messages-reply --as bot` lands in the same direct chat, attached to the message it answers |
-| Markdown             | `--markdown` sends `msg_type: post` with an `md` tag; lists and code blocks render           |
-| Exactly once         | `--idempotency-key` becomes the request's `uuid`; two calls with one key return the same `message_id` |
-| No echo              | The bot's own messages do not come back as `im.message.receive_v1`; the connector also drops `sender_type: bot` |
+| Check | Result |
+| --- | --- |
+| Receiving | One JSON line per message: `message_id`, `chat_id` (`oc_…`), `chat_type`, `sender_id` (`ou_…`), `sender_type`, `content` (already rendered), `create_time` (ms) |
+| Sending | `im +messages-reply --as bot` lands in the same chat, attached to the message it answers |
+| Markdown | `--markdown` sends `msg_type: post` with an `md` tag; lists and code blocks render |
+| Exactly once | `--idempotency-key` becomes the request's `uuid`; two calls with one key return the same `message_id` |
+| No echo | The bot's own messages do not come back as `im.message.receive_v1`; the connector also drops `sender_type` other than `user` |
+| Images and files | The bot downloads both with `im +messages-resources-download --type image\|file`; the rendered content carries `img_…` and `<file key=\"file_…\" name=\"…\"/>` |
+| Bot identity | `api GET /open-apis/bot/v3/info --as bot` gives `open_id` and `app_name` |
+
+Not yet seen on a live app: a group mention (the mention's id for a bot), so the connector matches either the bot's
+open id or its app name.
 
 ## Test
 
@@ -67,9 +90,10 @@ Then, in Pi Pocket:
 node --test test/*.test.ts
 ```
 
-The tests cover the pure parts: parsing one event line, mapping it, the chat filter, cutting a long reply, and the
-reply key. They make no network call and start no process. A fake `lark-cli` drives the rest: the abort path returns
-in under a second, and a split reply reaches it in parts.
+The tests cover the pure parts: one event line, the chat and group rules, what an image or a file becomes, the
+attachment refs, a file's type, cutting a long reply, and the reply key. They make no network call. A fake `lark-cli`
+drives the spawn paths: an abort returns in under a second, a split reply reaches it in parts, and a download comes
+back as bytes.
 
 Type check, with a `tsc` 5.9 or later and Pi Pocket's packages linked as `node_modules`:
 
@@ -82,5 +106,5 @@ tsc --noEmit -p .
 - One consumer of `im.message.receive_v1` for each app: a second `lark-cli event consume` (a probe too) makes Pi
   answer twice. Every probe runs with `--timeout`.
 - Messages sent while the connector is down are lost: Lark retries an event for a short time only.
-- Text only. An image or a file arrives as its kind, with no content; attaching those needs
-  `im +messages-resources-download` and the connector's `fetch`.
+- Pi cannot send an image or a file back: a reply is text.
+- A sticker has nothing to download.
