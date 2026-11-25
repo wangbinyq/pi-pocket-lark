@@ -83,8 +83,9 @@ Then, in Pi Pocket:
 | Bot identity | `api GET /open-apis/bot/v3/info --as bot` gives `open_id` and `app_name` |
 | Attachment path | `+messages-resources-download` may rename what it saves (`LICENSE` becomes `LICENSE.bin`) and answers `data.saved_path`; the connector reads that path, never the one it asked for |
 
-Not yet seen on a live app: a group mention (the mention's id for a bot), so the connector matches either the bot's
-open id or its app name.
+Not yet seen on a live app: a group mention, because this app's bot cannot be added to a group. The connector
+matches either the bot's open id or its app name, and a group message that matches neither is dropped, so a wrong
+guess costs a missing message, never a wrong answer.
 
 ## Test
 
@@ -110,3 +111,4 @@ tsc --noEmit -p .
 - Messages sent while the connector is down are lost: Lark retries an event for a short time only.
 - Pi cannot send an image or a file back: a reply is text.
 - A sticker has nothing to download.
+- A group needs the bot in it. Where an app's availability keeps the bot out of groups, only direct chats are possible.
