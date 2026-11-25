@@ -1,12 +1,16 @@
 /**
- * Lark（飞书）连接器，给 Pi Pocket 自带的 Relay 用：别人在飞书里私聊应用机器人，消息进入会话，Pi 的回复发回同一个单聊。
+ * Lark（飞书）连接器，给 Pi Pocket 自带的 Relay 用：私聊或群里 @ 机器人的消息进入会话，Pi 的回复回到原处；
+ * 图片和文件可以下载给 Pi 看。
  *
  * 收消息走 lark-cli 的本地事件总线（长连接，不需要公网地址），凭证留在 lark-cli 自己的配置里；围栏、只投递一次、
- * 限流、磁盘队列和重试都是 Relay 的事。群聊、图片和文件还没有接。
+ * 限流、磁盘队列和重试都是 Relay 的事。Pi 还不能往飞书发图片或文件。
  */
 import { spawn } from "node:child_process";
-import { setTimeout as delay } from "node:timers/promises";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Web } from "./_pocket.d.ts";
 
 export const KIND = "lark";
@@ -14,6 +18,7 @@ export const KIND = "lark";
 const DEFAULT_BINARY = "lark-cli";
 const DEFAULT_MAX_CHARS = 3000;
 const KEY_LIMIT = 50;
+const KIND_ONLY = new Set(["image", "file", "audio", "video", "media", "sticker"]);
 
 type RelayValues = Readonly<Record<string, string | number | boolean | undefined>>;
 
@@ -36,6 +41,13 @@ interface RelayAuthor {
     bot?: boolean;
 }
 
+interface RelayFile {
+    name: string;
+    type?: string;
+    size?: number;
+    ref: string;
+}
+
 interface RelayEvent {
     id: string;
     text: string;
@@ -47,6 +59,7 @@ interface RelayEvent {
     at?: number;
     url?: string;
     attachments?: readonly string[];
+    files?: readonly RelayFile[];
 }
 
 interface RelayContext {
@@ -59,6 +72,8 @@ interface RelayContext {
     log(text: string): void;
     sleep(ms: number): Promise<void>;
 }
+
+type ShortContext = Pick<RelayContext, "values" | "signal" | "log">;
 
 interface RelayReply {
     text: string;
@@ -81,15 +96,27 @@ interface RelayConnector {
     check?(values: RelayValues): string | undefined;
     poll?(context: RelayContext): Promise<void>;
     run?(context: RelayContext): Promise<void>;
-    reply?(
-        context: Pick<RelayContext, "values" | "signal" | "log">,
-        reply: RelayReply,
-    ): Promise<{ id?: string } | void>;
+    reply?(context: ShortContext, reply: RelayReply): Promise<{ id?: string } | void>;
+    fetch?(context: ShortContext, file: RelayFile, maxBytes: number): Promise<{ data: Uint8Array; type: string }>;
 }
 
 interface RelayService {
     api: number;
     register(connector: RelayConnector): () => void;
+}
+
+export interface Rules {
+    readonly chats?: ReadonlySet<string>;
+    readonly groups?: boolean;
+    readonly botId?: string;
+    readonly botName?: string;
+}
+
+interface Command {
+    readonly code: number | null;
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly failure?: Error;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -106,7 +133,94 @@ export function words(value: unknown): string[] {
         .filter((word) => word !== "");
 }
 
-export function eventOf(raw: unknown, chats: ReadonlySet<string>): RelayEvent | undefined {
+function mentioned(item: Record<string, unknown>, rules: Rules): boolean {
+    const list = Array.isArray(item.mentions) ? item.mentions : [];
+
+    return list.some((each) => {
+        const entry = record(each);
+        const id = text(entry?.id);
+        const name = text(entry?.name);
+
+        return (rules.botId !== undefined && id === rules.botId) || (rules.botName !== undefined && name === rules.botName);
+    });
+}
+
+export function resourcesOf(content: string, messageId: string): RelayFile[] {
+    const files: RelayFile[] = [];
+
+    for (const match of content.matchAll(/img_[0-9A-Za-z_-]+/g)) {
+        files.push({ name: "image", ref: `${messageId}|image|${match[0]}` });
+    }
+
+    for (const match of content.matchAll(/key="(file_[^"]+)"(?:[^>]*?\bname="([^"]*)")?/g)) {
+        files.push({
+            name: match[2] === undefined || match[2] === "" ? "file" : match[2],
+            ref: `${messageId}|file|${match[1]}`,
+        });
+    }
+
+    return files;
+}
+
+export function refOf(ref: string): { messageId: string; kind: "image" | "file"; key: string } | undefined {
+    const [messageId, kind, key] = ref.split("|");
+
+    if (messageId === undefined || messageId === "" || key === undefined || key === "") {
+        return undefined;
+    }
+
+    if (kind !== "image" && kind !== "file") {
+        return undefined;
+    }
+
+    return { messageId, kind, key };
+}
+
+export function mimeOf(data: Uint8Array, name: string): string {
+    const head = Array.from(data.subarray(0, 12), (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+    if (head.startsWith("89504e47")) {
+        return "image/png";
+    }
+
+    if (head.startsWith("ffd8ff")) {
+        return "image/jpeg";
+    }
+
+    if (head.startsWith("47494638")) {
+        return "image/gif";
+    }
+
+    if (head.startsWith("52494646") && head.slice(16, 24) === "57454250") {
+        return "image/webp";
+    }
+
+    if (head.startsWith("25504446")) {
+        return "application/pdf";
+    }
+
+    const extension = name.toLowerCase().split(".").at(-1) ?? "";
+    const byExtension: Record<string, string> = {
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        gif: "image/gif",
+        webp: "image/webp",
+        pdf: "application/pdf",
+        txt: "text/plain",
+        md: "text/markdown",
+        json: "application/json",
+        csv: "text/csv",
+        zip: "application/zip",
+        opus: "audio/opus",
+        mp3: "audio/mpeg",
+        mp4: "video/mp4",
+    };
+
+    return byExtension[extension] ?? "application/octet-stream";
+}
+
+export function eventOf(raw: unknown, rules: Rules): RelayEvent | undefined {
     const item = record(raw);
 
     if (item === undefined) {
@@ -116,20 +230,34 @@ export function eventOf(raw: unknown, chats: ReadonlySet<string>): RelayEvent | 
     const id = text(item.message_id) ?? text(item.id);
     const chat = text(item.chat_id);
 
-    if (id === undefined || chat === undefined || chats.size > 0 && !chats.has(chat)) {
+    if (id === undefined || chat === undefined) {
         return undefined;
     }
 
-    if (item.chat_type !== "p2p" || item.sender_type !== "user") {
+    if (rules.chats !== undefined && rules.chats.size > 0 && !rules.chats.has(chat)) {
+        return undefined;
+    }
+
+    if (item.sender_type !== "user") {
+        return undefined;
+    }
+
+    if (item.chat_type === "group") {
+        if (rules.groups !== true || !mentioned(item, rules)) {
+            return undefined;
+        }
+    } else if (item.chat_type !== "p2p") {
         return undefined;
     }
 
     const kind = text(item.message_type) ?? "text";
+    const content = typeof item.content === "string" ? item.content : "";
     const at = Number(item.create_time);
     const thread = text(item.thread_id);
+    const files = kind === "text" ? [] : resourcesOf(content, id);
     const event: RelayEvent = {
         id,
-        text: typeof item.content === "string" ? item.content : "",
+        text: KIND_ONLY.has(kind) ? "" : content,
         author: { id: text(item.sender_id) ?? chat, name: text(item.sender_id) ?? chat, bot: false },
         channel: chat,
         mentioned: true,
@@ -144,13 +272,17 @@ export function eventOf(raw: unknown, chats: ReadonlySet<string>): RelayEvent | 
     }
 
     if (kind !== "text") {
-        event.attachments = [kind];
+        event.attachments = files.length > 0 ? files.map((file) => `${kind} ${file.name}`) : [kind];
+    }
+
+    if (files.length > 0) {
+        event.files = files;
     }
 
     return event;
 }
 
-export function parseEventLine(line: string, chats: ReadonlySet<string>): RelayEvent | undefined {
+export function parseEventLine(line: string, rules: Rules): RelayEvent | undefined {
     const trimmed = line.trim();
 
     if (!trimmed.startsWith("{")) {
@@ -165,7 +297,7 @@ export function parseEventLine(line: string, chats: ReadonlySet<string>): RelayE
         return undefined;
     }
 
-    return eventOf(raw, chats);
+    return eventOf(raw, rules);
 }
 
 export function splitText(value: string, max: number): string[] {
@@ -221,56 +353,18 @@ function profileArgs(values: RelayValues): string[] {
     return profile === undefined ? [] : ["--profile", profile];
 }
 
-function answer(stdout: string, stderr: string): string | undefined {
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(stdout.trim());
-    } catch {
-        return undefined;
-    }
-
-    const body = record(parsed);
-    const error = record(body?.error);
-    const message = text(error?.message) ?? text(body?.error);
-
-    if (body?.ok === true) {
-        const data = record(body.data);
-
-        return text(data?.message_id);
-    }
-
-    return message ?? stderr.trim().split("\n").at(-1);
-}
-
-function send(
-    values: RelayValues,
-    signal: AbortSignal,
-    target: string,
-    body: string,
-    key: string,
-): Promise<string | undefined> {
-    const args = [
-        "im",
-        "+messages-reply",
-        "--message-id",
-        target,
-        "--as",
-        "bot",
-        "--markdown",
-        "-",
-        "--idempotency-key",
-        key,
-        "--format",
-        "json",
-        ...profileArgs(values),
-    ];
-    const child = spawn(binary(values), args, { stdio: ["pipe", "pipe", "pipe"] });
+function runCli(values: RelayValues, args: string[], signal: AbortSignal, input?: string): Promise<Command> {
+    const child = spawn(binary(values), [...args, ...profileArgs(values)], { stdio: ["pipe", "pipe", "pipe"] });
     const stop = () => child.kill("SIGTERM");
     signal.addEventListener("abort", stop, { once: true });
-    child.stdin.end(body);
 
-    return new Promise<string | undefined>((resolve, reject) => {
+    if (input === undefined) {
+        child.stdin.destroy();
+    } else {
+        child.stdin.end(input);
+    }
+
+    return new Promise<Command>((resolve, reject) => {
         let stdout = "";
         let stderr = "";
         let failure: Error | undefined;
@@ -290,28 +384,140 @@ function send(
             signal.removeEventListener("abort", stop);
 
             if (signal.aborted) {
-                reject(new Error("回复被停止。"));
+                reject(new Error("命令被停止。"));
                 return;
             }
 
-            const problem = failure === undefined ? (code === 0 ? undefined : answer(stdout, stderr) ?? `lark-cli 退出（code ${code}）。`) : failure.message;
-
-            if (problem !== undefined) {
-                reject(new Error(`飞书没有收下这条回复：${problem}`));
-                return;
-            }
-
-            resolve(answer(stdout, stderr));
+            resolve({ code, stdout, stderr, failure });
         });
     });
+}
+
+function reasonOf(command: Command): string | undefined {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(command.stdout.trim());
+    } catch {
+        parsed = undefined;
+    }
+
+    const body = record(parsed);
+    const error = record(body?.error);
+    const said = command.stderr
+        .trim()
+        .split("\n")
+        .filter((line) => line !== "");
+    const interesting = said.filter((line) => /reason|error|fail|refus|denied|scope|expired/i.test(line));
+
+    return (
+        text(error?.message) ??
+        (interesting.length > 0 ? interesting : said).slice(-2).join(" ") ??
+        undefined
+    );
+}
+
+function messageId(command: Command): string | undefined {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(command.stdout.trim());
+    } catch {
+        return undefined;
+    }
+
+    const body = record(parsed);
+    const data = record(body?.data);
+
+    return body?.ok === true ? text(data?.message_id) : undefined;
+}
+
+async function botOf(values: RelayValues, signal: AbortSignal): Promise<{ id?: string; name?: string }> {
+    const command = await runCli(
+        values,
+        ["api", "GET", "/open-apis/bot/v3/info", "--as", "bot", "--format", "json"],
+        signal,
+    );
+
+    if (command.code !== 0) {
+        return {};
+    }
+
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(command.stdout.trim());
+    } catch {
+        return {};
+    }
+
+    const data = record(record(parsed)?.data);
+
+    return { id: text(data?.open_id), name: text(data?.app_name) };
+}
+
+async function fetchFile(
+    context: ShortContext,
+    file: RelayFile,
+    maxBytes: number,
+): Promise<{ data: Uint8Array; type: string }> {
+    const parts = refOf(file.ref);
+
+    if (parts === undefined) {
+        throw new Error("这个附件没有可用的标识。");
+    }
+
+    const folder = mkdtempSync(join(tmpdir(), "lark-relay-"));
+
+    try {
+        const name = file.name.replace(/[^\w.-]+/g, "_").slice(0, 60) || "resource";
+        const output = join(folder, name);
+        const command = await runCli(
+            context.values,
+            [
+                "im",
+                "+messages-resources-download",
+                "--message-id",
+                parts.messageId,
+                "--file-key",
+                parts.key,
+                "--type",
+                parts.kind,
+                "--output",
+                output,
+                "--as",
+                "bot",
+                "--format",
+                "json",
+            ],
+            context.signal,
+        );
+
+        if (command.code !== 0) {
+            throw new Error(`飞书没有给出这个附件：${reasonOf(command) ?? "没有说明"}`);
+        }
+
+        const size = statSync(output).size;
+
+        if (size > maxBytes) {
+            throw new Error(`这个附件有 ${size} 字节，超过上限 ${maxBytes} 字节。`);
+        }
+
+        const data = readFileSync(output);
+
+        return { data, type: mimeOf(data, name) };
+    } finally {
+        rmSync(folder, { recursive: true, force: true });
+    }
 }
 
 function lark(): RelayConnector {
     return {
         kind: KIND,
         label: "Lark",
-        description: "飞书里的单聊：别人私聊应用机器人，消息进入会话，Pi 的回答回到同一个单聊。",
+        description: "飞书：私聊机器人，或在群里 @ 机器人。图片和文件可以下载给 Pi 看。",
         shape: "stream",
+        mentions: true,
         idempotentReply: true,
         fields: [
             { name: "binary", label: "lark-cli", type: "text", default: DEFAULT_BINARY },
@@ -320,7 +526,14 @@ function lark(): RelayConnector {
                 name: "chats",
                 label: "Chats",
                 type: "text",
-                description: "只接这些 oc_ 单聊，逗号分隔；留空接全部。",
+                description: "只接这些 oc_ 会话，逗号分隔；留空接全部。",
+            },
+            {
+                name: "groups",
+                label: "群聊",
+                type: "boolean",
+                default: true,
+                description: "关掉就只接私聊。",
             },
             {
                 name: "max_chars",
@@ -334,19 +547,22 @@ function lark(): RelayConnector {
         check(values) {
             const wrong = words(values.chats).find((chat) => !/^oc_[0-9A-Za-z]+$/.test(chat));
 
-            return wrong === undefined ? undefined : `"${wrong}" 不是飞书单聊 id，它以 oc_ 开头。`;
+            return wrong === undefined ? undefined : `"${wrong}" 不是飞书会话 id，它以 oc_ 开头。`;
         },
         async run(context) {
-            const args = [
-                "event",
-                "consume",
-                "im.message.receive_v1",
-                "--as",
-                "bot",
-                ...profileArgs(context.values),
-            ];
             const chats = new Set(words(context.values.chats));
-            const child = spawn(binary(context.values), args, { stdio: ["pipe", "pipe", "pipe"] });
+            const groups = context.values.groups === undefined ? true : context.values.groups === true;
+            const bot = groups ? await botOf(context.values, context.signal) : {};
+
+            if (groups && bot.id === undefined && bot.name === undefined) {
+                context.log("没有取到机器人的身份：群里 @ 机器人的消息不会进来。");
+            }
+
+            const rules: Rules = { chats, groups, botId: bot.id, botName: bot.name };
+            const args = ["event", "consume", "im.message.receive_v1", "--as", "bot"];
+            const child = spawn(binary(context.values), [...args, ...profileArgs(context.values)], {
+                stdio: ["pipe", "pipe", "pipe"],
+            });
 
             if (child.stdout === null || child.stderr === null) {
                 throw new Error("lark-cli 没有给出输出。");
@@ -381,7 +597,7 @@ function lark(): RelayConnector {
             });
             const reading = (async () => {
                 for await (const line of lines) {
-                    const event = parseEventLine(line, chats);
+                    const event = parseEventLine(line, rules);
 
                     if (event !== undefined) {
                         await context.emit([event]);
@@ -403,10 +619,6 @@ function lark(): RelayConnector {
 
             const code = await closed;
 
-            if (context.signal.aborted) {
-                return;
-            }
-
             if (failure !== undefined) {
                 throw failure;
             }
@@ -416,9 +628,7 @@ function lark(): RelayConnector {
             }
 
             const said = tail.trim().split("\n").filter((line) => line !== "");
-            const interesting = said.filter(
-                (line) => /reason|error|fail|refus|denied|scope|expired/i.test(line),
-            );
+            const interesting = said.filter((line) => /reason|error|fail|refus|denied|scope|expired/i.test(line));
             const why = (interesting.length > 0 ? interesting : said)
                 .slice(-3)
                 .join(" ")
@@ -443,11 +653,36 @@ function lark(): RelayConnector {
             let id: string | undefined;
 
             for (const [index, part] of parts.entries()) {
-                id = (await send(context.values, context.signal, target, part, replyKey(reply.key, index))) ?? id;
+                const command = await runCli(
+                    context.values,
+                    [
+                        "im",
+                        "+messages-reply",
+                        "--message-id",
+                        target,
+                        "--as",
+                        "bot",
+                        "--markdown",
+                        "-",
+                        "--idempotency-key",
+                        replyKey(reply.key, index),
+                        "--format",
+                        "json",
+                    ],
+                    context.signal,
+                    part,
+                );
+
+                if (command.code !== 0) {
+                    throw new Error(`飞书没有收下这条回复：${reasonOf(command) ?? `lark-cli 退出（code ${command.code}）`}`);
+                }
+
+                id = messageId(command) ?? id;
             }
 
             return id === undefined ? undefined : { id };
         },
+        fetch: fetchFile,
     };
 }
 
